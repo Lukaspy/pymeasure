@@ -57,6 +57,8 @@ class AgilentB1500(SCPIUnknownMixin, Instrument):
         )
         self._smu_names = {}
         self._smu_references = {}
+        self._cmu_name = {}
+        self._cmu_reference = {}
 
     @property
     def smu_references(self):
@@ -69,6 +71,17 @@ class AgilentB1500(SCPIUnknownMixin, Instrument):
         """Returns all SMU names.
         """
         return self._smu_names
+
+    def cmu_reference(self):
+        """Returns CMU instance.
+        """
+        return self._cmu_reference.values()
+
+    @property
+    def cmu_name(self):
+        """Returns CMU name.
+        """
+        return self._cmu_name
 
     def query_learn(self, query_type):
         """Queries settings from the instrument (``*LRN?``).
@@ -113,7 +126,9 @@ class AgilentB1500(SCPIUnknownMixin, Instrument):
             'B1511B': 'MPSMU',
             'B1510A': 'HPSMU',
             'B1514A': 'MCSMU',
-            'B1520A': 'MFCMU'
+            'B1520A': 'MFCMU',
+            'B1530A': 'WGFMU',
+            'B1520A/N1301A': 'SCUU'
         }
         out = {}
         for i, module in enumerate(modules):
@@ -163,6 +178,24 @@ class AgilentB1500(SCPIUnknownMixin, Instrument):
                         self.initialize_smu(
                             channel, smu_type, 'SMU' + str(i)))
                 i += 1
+
+    def initialize_cmu(self):
+        """ Initializes CMU instance by calling :class:`.CMU`.
+
+        :rtype: :class:`.CMU`
+        """
+        modules = self.query_modules()
+        for channel, cmu_type in modules.items():
+            if 'SCUU' in cmu_type:
+                self._cmu_name[channel] = cmu_type
+                cmu_reference = CMU(self, channel, cmu_type, "CMU")
+                self._cmu_reference[channel] = cmu_reference
+                break
+            elif 'MFCMU' in cmu_type:
+                self._cmu_name[channel] = cmu_type
+                cmu_reference = CMU(self, channel, cmu_type, "CMU")
+                self._cmu_reference[channel] = cmu_type
+                break
 
     def pause(self, pause_seconds):
         """ Pauses Command Execution for given time in seconds (``PA``)
@@ -526,7 +559,7 @@ class AgilentB1500(SCPIUnknownMixin, Instrument):
         mode = strict_range(mode, range(0, 11))
         self.write("FMT %d, %d" % (output_format, mode))
         self.check_errors()
-        if self._smu_names == {}:
+        if self._smu_names == {} and self._cmu_name == {}:
             print(
                 'No SMU names available for formatting, '
                 'instead channel numbers will be used. '
@@ -537,8 +570,12 @@ class AgilentB1500(SCPIUnknownMixin, Instrument):
                 'instead channel numbers will be used. '
                 'Call data_format after initializing all SMUs.'
             )
-        self._data_format = self._data_formatting(
-            "FMT%d" % output_format, self._smu_names)
+        if self._cmu_name != {}:
+            self._data_format = self._data_formatting(
+                "FMT%d" % output_format, self._cmu_name)
+        else:
+            self._data_format = self._data_formatting(
+                "FMT%d" % output_format, self._smu_names)
 
     ######################################
     # Measurement Settings
@@ -575,23 +612,30 @@ class AgilentB1500(SCPIUnknownMixin, Instrument):
 
     def meas_mode(self, mode, *args):
         """ Set Measurement mode of channels. Measurements will be taken in
-        the same order as the SMU references are passed. (``MM``)
+        the same order as the SMU references are passed. In case of CMU
+        measurement, only the CMU reference is passed. (``MM``)
 
         :param mode: Measurement mode
 
             * Spot
             * Staircase Sweep
             * Sampling
+            * C-V Sweep
+            * C-t Sampling
 
         :type mode: :class:`.MeasMode`
-        :param args: SMU references
-        :type args: :class:`.SMU`
+        :param args: SMU or CMU references
+        :type args: :class:`.SMU .CMU`
         """
         mode = MeasMode.get(mode)
         cmd = "MM %d" % mode.value
-        for smu in args:
-            if isinstance(smu, SMU):
-                cmd += ", %d" % smu.channel
+
+        for module in args:
+            if isinstance(module, SMU):
+                cmd += ", %d" % module.channel
+            elif isinstance(module, CMU):
+                cmd += ", %d" % module.channel
+
         self.write(cmd)
         self.check_errors()
 
@@ -841,6 +885,50 @@ class AgilentB1500(SCPIUnknownMixin, Instrument):
         abort = abort_values[abort]
         post = SamplingPostOutput.get(post).value
         self.write("MSC %d, %d" % (abort, post))
+        self.check_errors()
+
+    ######################################
+    # C-t Sampling Setup
+    ######################################
+
+    def ct_sampling_timing(self, hold_bias, interval, number, hold_base=0):
+        """ Sets Timing Parameters for the Sampling Measurement (``MT``)
+
+        :param hold_bias: Bias hold time
+        :type hold_bias: float
+        :param interval: Sampling interval
+        :type interval: float
+        :param number: Number of Samples
+        :type number: int
+        :param hold_base: Base hold time, defaults to 0
+        :type hold_base: float, optional
+        """
+        if interval >= 0.002:
+            hold_bias = strict_discrete_range(hold_bias, (0, 655.35), 0.01)
+            interval = strict_discrete_range(interval, (0, 65.535), 0.001)
+        else:
+            try:
+                hold_bias = strict_discrete_range(
+                    hold_bias, (-0.09, -0.0001), 0.0001)
+            except ValueError as error1:
+                try:
+                    hold_bias = strict_discrete_range(
+                        hold_bias, (0, 655.35), 0.01)
+                except ValueError as error2:
+                    raise ValueError(
+                        'Bias hold time does not match either '
+                        + 'of the two possible specifications: '
+                        + f'{error1} {error2}')
+            if interval >= 0.0001:
+                interval = strict_discrete_range(interval,
+                                                 (0, 0.00199), 0.00001)
+            else:
+                raise ValueError(
+                    f'Sampling interval {interval} is too short.')
+        hold_base = strict_discrete_range(hold_base, (0, 655.35), 0.01)
+
+        self.write("MTDCV %g, %g, %d, %g" %
+                   (hold_bias, interval, number, hold_base))
         self.check_errors()
 
     ######################################
@@ -1633,6 +1721,8 @@ class MeasMode(CustomIntEnum):
     SPOT = 1  #:
     STAIRCASE_SWEEP = 2  #:
     SAMPLING = 10  #:
+    CV_SWEEP = 18 #:
+    CT_SAMPLING = 26 #:
 
 
 class MeasOpMode(CustomIntEnum):
@@ -1694,6 +1784,178 @@ class WaitTimeType(CustomIntEnum):
     SMU_SOURCE = 1  #:
     SMU_MEASUREMENT = 2  #:
     CMU_MEASUREMENT = 3  #:
+
+
+class CmuCalibrationType(CustomIntEnum):
+    """Type of calibration"""
+    OPEN_CALIBRATION = 1
+    SHORT_CALIBRATION = 2
+    LOAD_CALIBRATION = 3
+
+class CmuMeasurementParams(CustomIntEnum):
+    """Type of calibration"""
+    Cp_R = 103
+    Cp_G = 100
+    Cs_R = 200
+
+class CmuRangeMode(CustomIntEnum):
+    """Type of ranging for CMU"""
+    AUTO_RANGING = 0
+    FIXED_RANGE = 2
+
+######################################
+# CMU Setup
+######################################
+
+
+class CMU():
+    """ Provides specific methods for the CMU of the Agilent B1500 mainframe
+
+    :param parent: Instance of the B1500 mainframe class
+    :type parent: :class:`.AgilentB1500`
+    :param int channel: Channel number of the SMU
+    :param str smu_type: Type of the SMU
+    :param str name: Name of the SMU
+    """
+
+    def __init__(self, parent, channel, cmu_type, name, **kwargs):
+        # to allow garbage collection for cyclic references
+        self._b1500 = weakref.proxy(parent)
+        channel = strict_discrete_set(channel, range(1, 11))
+        self.channel = channel
+        cmu_type = strict_discrete_set(
+            cmu_type,
+            ['SCUU', 'MFCMU'])
+        self.name = name
+
+    ##########################################
+    # Wrappers of B1500 communication methods
+    ##########################################
+    def write(self, string):
+        """Wraps :meth:`.Instrument.write` method of B1500.
+        """
+        self._b1500.write(string)
+
+    def ask(self, string):
+        """Wraps :meth:`~.Instrument.ask` method of B1500.
+        """
+        return self._b1500.ask(string)
+
+    def query_learn(self, query_type, command):
+        """Wraps :meth:`~.AgilentB1500.query_learn` method of B1500.
+        """
+        response = self._b1500.query_learn(query_type)
+        # query_learn returns settings of all smus
+        # pick setting for this smu only
+        response = response[command + str(self.channel)]
+        return response
+
+    def check_errors(self):
+        """Wraps :meth:`~.AgilentB1500.check_errors` method of B1500.
+        """
+        return self._b1500.check_errors()
+    ##########################################
+
+    def _query_status_raw(self):
+        return self._b1500.query_learn(str(self.channel))
+
+    @property
+    def status(self):
+        """Query status of the SMU."""
+        return self._b1500.query_learn_header(str(self.channel))
+
+    def enable(self):
+        """ Enable Source/Measurement Channel (``CN``)"""
+        self.write("CN %d" % self.channel)
+
+    def disable(self):
+        """ Disable Source/Measurement Channel (``CL``)"""
+        self.write("CL %d" % self.channel)
+
+    def set_adc(self, mode = 0, samples = 2):
+        self.write("ACT %d, %d" % (mode, samples))
+        self.check_errors()
+
+    def scuu_to_cmu(self):
+        """ Make connection path from CMU through SCUU"""
+        self.write("SSP %d, 4" % self.channel)
+
+    def phase_calibration(self):
+        """ Perform CMU Phase Calibration.
+            Supports other compensation modes. Currently
+            set to auto
+        """
+        self.write("ADJ %d, 0" % self.channel)
+
+    def query_phase_calibration(self):
+        """ Queries B1500 on status of Phase Calibration
+            Returns an int where:
+            0 = Success,
+            1 = Failed,
+            2 = Aborted,
+            3 = Not Yet Performed
+
+            :return: Int representing the status
+            :rtype: int
+        """
+
+        status = self.ask("ADJ?")
+        return status
+
+    def cmu_calibration(self, cal_type):
+        """ Performs open, short, or load correction for CMU
+
+            :param cal_type: the type of cal to perform
+        """
+
+        cal_type = CmuCalibrationType.get(cal_type)
+
+        mode = primary = secondary = None
+
+        if cal_type == CmuCalibrationType.OPEN_CALIBRATION:
+            mode = 100
+            primary = 0
+            secondary = 0
+        elif cal_type == CmuCalibrationType.SHORT_CALIBRATION:
+            mode = 400
+            primary = 0
+            secondary = 0
+        elif cal_type == CmuCalibrationType.LOAD_CALIBRATION:
+            mode = 400
+            primary = 0
+            secondary = 50
+
+        status = self.ask("DCORR %d, %d, %d, %d, %d" % (self.channel, cal_type.value, mode, primary, secondary))
+        self.check_errors()
+        return status
+
+    def measurement_mode(self, mode):
+        """ Sets the cmu measurement parameters. Currently allows for
+            measurement of Cp-R, Cp-G, and Cs-R, although the B1500 supports
+            many others.
+
+            :param mode: the measurement mode to set
+        """
+
+        mode = CmuMeasurementParams(mode)
+        self.write("IMP %d" % mode)
+
+    def set_range(self, mode, measurement_range=0):
+        """ Sets the cmu ranging to auto or a fixed range
+            Currently only supports auto ranging
+
+            :param mode: the ranging mode to set
+            :param measurement_range: the fixed range to set
+        """
+
+        mode = CmuRangeMode(mode)
+        if mode == CmuRangeMode.AUTO_RANGING:
+            self.write("RC %d, %d" % (self.channel, mode))
+        elif mode == CmuRangeMode.FIXED_RANGE:
+            print("fixed range currently not implemented")
+            return
+        self.check_errors()
+
 
 ###############################################################################
 # Query Learn: Parse Instrument settings into human readable format
